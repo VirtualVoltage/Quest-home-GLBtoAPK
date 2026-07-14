@@ -20,7 +20,6 @@
 #include <cctype>
 #include <cstring>
 #include <iostream>
-#include <filesystem>   // GLBtoAPK.py lookup + the temp dir the converted APK lands in
 #include <thread>   // background scene-load worker (the window/UI stay live while parsing)
 
 #ifdef _WIN32
@@ -189,6 +188,7 @@ static void hsrHttpServer(int port) {
 #include "io/gltf_export.h"   // Blender round-trip: env -> glTF 2.0 project
 #include "app_icon_rgba.h"    // embedded 64x64 window/taskbar icon (from icon.png)
 #include "io/gltf_import.h"   // Blender round-trip: re-import an edited glTF project
+#include "io/glb2apk.h"       // a dropped .glb/.gltf -> a Quest Home source APK (compiled in; no external tool)
 #include "miniz.h"
 #ifdef _WIN32
 #include <windows.h>
@@ -227,69 +227,16 @@ static void genEditorIcon(int S, std::vector<unsigned char>& px) {
     }
 }
 
-// ── Dropped .glb/.gltf -> Quest Home source APK (tools/GLBtoAPK.py) ────────────────────────────────
-// A raw model is not an environment: the V79 loader keys on assets/scene.zip. So a dropped model is
-// handed to tools/GLBtoAPK.py, which repacks it into a source APK (externalizes textures, folds the
-// real UV set into TEXCOORD_0, nests .ovrscene -> scene.zip -> .apk); the drop then continues down
-// the NORMAL APK path as if that APK had been dropped in the first place. The APK lands in the temp
-// dir, so nothing is ever written next to (or over) the user's model.
-static bool endsWithCI_(const std::string& s, const char* suf) {
-    size_t n = std::strlen(suf); if (s.size() < n) return false;
-    for (size_t i = 0; i < n; i++) { char a = s[s.size()-n+i], b = suf[i];
-        if (a>='A'&&a<='Z') a=(char)(a-'A'+'a'); if (b>='A'&&b<='Z') b=(char)(b-'A'+'a'); if (a!=b) return false; }
-    return true;
-}
-static std::string glbToApk(const std::string& glb) {
-    namespace fs = std::filesystem; std::error_code ec;
-
-    std::string script;   // shipped beside the exe, or run from the project tree
-    if (const char* e = std::getenv("HSR_GLB2APK")) if (fs::exists(e, ec)) script = e;
-    if (script.empty())
-        for (const std::string& c : { AppConfig::exeRel("tools/GLBtoAPK.py"),                  // shipped beside the exe
-                                      AppConfig::exeRel("../QuestHomeEditor/tools/GLBtoAPK.py"),  // dev tree: exe in build/
-                                      AppConfig::exeRel("../tools/GLBtoAPK.py"),
-                                      std::string("QuestHomeEditor/tools/GLBtoAPK.py"),         // run from the repo root
-                                      std::string("tools/GLBtoAPK.py") })
-            if (!c.empty() && fs::exists(c, ec)) { script = c; break; }
-    if (script.empty()) { fprintf(stderr, "[GLB2APK] tools/GLBtoAPK.py not found\n"); return ""; }
-
-#ifdef _WIN32
-    const char* quiet = " >NUL 2>&1"; const char* pys[] = { "python", "py" };
-#else
-    const char* quiet = " >/dev/null 2>&1"; const char* pys[] = { "python3", "python" };
-#endif
-    std::string py;
-    if (const char* e = std::getenv("HSR_PYTHON")) py = e;
-    if (py.empty())
-        for (const char* c : pys) if (system((std::string(c) + " --version" + quiet).c_str()) == 0) { py = c; break; }
-    if (py.empty()) { fprintf(stderr, "[GLB2APK] no python interpreter found (set HSR_PYTHON)\n"); return ""; }
-
-    fs::path out = fs::temp_directory_path(ec) / "QuestHomeEditor";
-    fs::create_directories(out, ec);
-    out /= fs::path(glb).stem().string() + ".apk";
-
-    std::string cmd = "\"" + py + "\" \"" + script + "\" \"" + glb + "\" -o \"" + out.string() + "\"";
-#ifdef _WIN32
-    cmd = "\"" + cmd + "\"";   // cmd.exe eats the outer pair, so the inner quotes survive
-#endif
-    int rc = system(cmd.c_str());
-    if (rc != 0 || !fs::exists(out, ec)) {
-        fprintf(stderr, "[GLB2APK] conversion FAILED (exit %d): %s\n", rc, glb.c_str());
-        return "";
-    }
-    fprintf(stderr, "[GLB2APK] %s -> %s\n", glb.c_str(), out.string().c_str());
-    return out.string();
-}
-
 static void dropCb(GLFWwindow*, int count, const char** paths) {
     if (count > 0 && paths[0]) {
         std::string p = paths[0];
-        // a raw model isn't an env — convert it first, then fall through as if an APK was dropped
-        if (endsWithCI_(p, ".glb") || endsWithCI_(p, ".gltf")) {
-            std::string apk = glbToApk(p);
+        // A dropped .glb/.gltf is a raw model, NOT an env (every loader keys on assets/scene.zip), so
+        // repack it into a source APK first (io/glb2apk.h) and carry on as if an APK had been dropped.
+        if (glb2apk::isModel(p)) {
+            std::string err, apk = glb2apk::convertForDrop(p, err);
             if (apk.empty()) {   // keep the CURRENT env loaded rather than tear the session down
                 if (g_editor && !std::getenv("HSR_NOUI") && g_editor->ready)
-                    g_editor->setStatus("Could not convert that model to a Quest Home APK (see log).");
+                    g_editor->setStatus("Can't convert that model: " + err);
                 return;
             }
             p = apk;
